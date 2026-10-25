@@ -1,0 +1,4 @@
+# QNAP TS-119 (Marvell Kirkwood, ARMv5TE, no FPU): fully static musl binary,
+# linked with Rust's bundled lld so no ARM toolchain or container is needed.
+[target.armv5te-unknown-linux-musleabi]
+linker = "rust-lld"

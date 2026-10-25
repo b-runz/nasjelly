@@ -1,0 +1,21 @@
+# Copy to nasjelly.toml and edit. Run: nasjelly [path/to/nasjelly.toml]
+
+server_name = "NasJelly"
+port = 8096
+
+# The single login used by the Roku app
+username = "user"
+password = "change-me"
+
+# ffmpeg/ffprobe on PATH, or full paths
+ffmpeg = "ffmpeg"
+ffprobe = "ffprobe"
+
+# Scratch space for remuxed HLS segments (a few segments at a time).
+# Defaults to the system temp dir; on the QNAP use a disk share, /tmp is tiny RAM.
+# transcode_dir = "/share/Downloads/.nasjelly-tmp"
+
+# Each folder shows up as a tile on the Roku home screen
+[[folders]]
+name = "Downloads"
+path = "/share/Downloads"
