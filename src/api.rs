@@ -20,7 +20,7 @@ use crate::config::Config;
 use crate::hls::{self, Keyframes, Transcoder};
 use crate::library::{self, Library, display_name, external_subs, hash_id};
 use crate::playback::{self, AudioOut, Decision, DeviceProfile};
-use crate::probe::{MediaInfo, Prober, Stream};
+use crate::probe::{MediaInfo, Prober, Stream, StreamKind};
 use crate::stream;
 
 pub const SERVER_VERSION: &str = "10.10.7";
@@ -87,6 +87,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/videos/{id}/master.m3u8", get(hls_playlist))
         .route("/videos/{id}/main.m3u8", get(hls_playlist))
         .route("/videos/{id}/hls/{segment}", get(hls_segment))
+        .route("/videos/{id}/subtitletracks", get(subtitle_tracks))
+        .route("/videos/{id}/subtitle.vtt", get(subtitle_vtt))
         .route("/videos/{id}/{msid}/subtitles/{index}/{start}/{file}", get(subtitle))
         .route("/videos/{id}/{msid}/subtitles/{index}/{file}", get(subtitle_no_start))
         .route("/sessions", get(empty_array))
@@ -99,6 +101,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .layer(middleware::from_fn(log_requests))
+        .layer(middleware::from_fn(cors))
         .with_state(state)
 }
 
@@ -156,6 +159,22 @@ async fn auth(State(st): St, req: Request, next: Next) -> Response {
         }
     }
     next.run(req).await
+}
+
+/// The Chromecast receiver fetches HLS playlists and segments cross-origin, which browsers
+/// (and the cast web player) only allow with CORS headers. Answers preflights before auth.
+async fn cors(req: Request, next: Next) -> Response {
+    let mut resp = if req.method() == axum::http::Method::OPTIONS {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        next.run(req).await
+    };
+    let h = resp.headers_mut();
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
+    h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS".parse().unwrap());
+    h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, "*".parse().unwrap());
+    h.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, "Content-Length, Content-Range".parse().unwrap());
+    resp
 }
 
 async fn log_requests(req: Request, next: Next) -> Response {
@@ -791,6 +810,82 @@ async fn subtitle_response(st: &AppState, id: &str, index: usize) -> Response {
             .into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// Text subtitle codecs ffmpeg can convert to WebVTT. Bitmap formats (PGS, VobSub) need OCR.
+const TEXT_SUB_CODECS: [&str; 7] = ["subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"];
+
+/// Subtitle tracks a Chromecast can show. Ids are `e<ffprobe index>` for tracks inside the
+/// file and `x<n>` for external .srt files; `subtitle_vtt` takes them as `track`.
+async fn subtitle_tracks(State(st): St, UrlPath(id): UrlPath<String>) -> Response {
+    let (path, info) = match video_info(&st, &id).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let mut tracks = Vec::new();
+    for s in info.streams.iter().filter(|s| s.kind == StreamKind::Subtitle) {
+        if !TEXT_SUB_CODECS.contains(&s.codec.as_str()) {
+            continue;
+        }
+        let lang = s.language.clone().unwrap_or_default();
+        let mut title = s.title.clone().unwrap_or_else(|| format!("{} {}", lang.to_uppercase(), s.codec).trim().to_string());
+        if s.is_forced {
+            title.push_str(" (forced)");
+        }
+        tracks.push(json!({ "id": format!("e{}", s.index), "title": title, "language": s.language, "external": false }));
+    }
+    for (i, sub) in external_subs(&path).iter().enumerate() {
+        let title = format!("{} (file)", sub.title);
+        tracks.push(json!({ "id": format!("x{i}"), "title": title, "language": sub.language, "external": true }));
+    }
+    json_response(json!({ "Tracks": tracks }))
+}
+
+async fn subtitle_vtt(State(st): St, UrlPath(id): UrlPath<String>, RawQuery(raw): RawQuery) -> Response {
+    let q = query_map(&raw);
+    let Some(track) = q.get("track") else { return StatusCode::BAD_REQUEST.into_response() };
+    let (path, info) = match video_info(&st, &id).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let vtt = if let Some(n) = track.strip_prefix('x').and_then(|n| n.parse::<usize>().ok()) {
+        let subs = external_subs(&path);
+        let Some(sub) = subs.get(n) else { return StatusCode::NOT_FOUND.into_response() };
+        match tokio::fs::read(&sub.path).await {
+            Ok(bytes) => crate::vtt::srt_to_vtt(&to_utf8(&bytes)),
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        }
+    } else if let Some(n) = track.strip_prefix('e').and_then(|n| n.parse::<usize>().ok()) {
+        let is_text_sub = info
+            .streams
+            .iter()
+            .any(|s| s.index == n && s.kind == StreamKind::Subtitle && TEXT_SUB_CODECS.contains(&s.codec.as_str()));
+        if !is_text_sub {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        // reads the whole file once; cheap on CPU since only the subtitle stream is converted
+        let out = tokio::process::Command::new(&st.cfg.ffmpeg)
+            .args(["-nostdin", "-v", "error", "-i"])
+            .arg(&path)
+            .args(["-map", &format!("0:{n}"), "-f", "webvtt", "-"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await;
+        match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+            Ok(o) => {
+                println!("subtitle extract: {}", String::from_utf8_lossy(&o.stderr).trim());
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            Err(e) => {
+                println!("subtitle extract: cannot run ffmpeg: {e}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    } else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    ([(header::CONTENT_TYPE, "text/vtt; charset=utf-8")], vtt).into_response()
 }
 
 /// Subtitle files are often Windows-1252/Latin-1; the Roku wants UTF-8.

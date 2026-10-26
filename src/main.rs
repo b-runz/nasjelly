@@ -7,6 +7,7 @@ mod mkv;
 mod playback;
 mod probe;
 mod stream;
+mod vtt;
 
 use axum::extract::Request;
 use axum::http::Uri;
