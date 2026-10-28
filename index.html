@@ -1,0 +1,66 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>NasJelly receiver</title>
+<script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; }
+  cast-media-player { --splash-image: none; }
+  /* diagnostics: last receiver events, bottom-left, so a black screen still says why */
+  #log { position: fixed; left: 12px; bottom: 12px; max-width: 70%; margin: 0; padding: 8px 10px;
+         font: 18px/1.3 monospace; color: #9f9; background: rgba(0,0,0,.65); white-space: pre-wrap; }
+  #log.err { color: #f99; }
+</style>
+</head>
+<body>
+<cast-media-player></cast-media-player>
+<pre id="log"></pre>
+<script>
+const context = cast.framework.CastReceiverContext.getInstance();
+const player = context.getPlayerManager();
+const E = cast.framework.events.EventType;
+const logEl = document.getElementById('log');
+const lines = [];
+
+function log(text, isError) {
+  console.log(text);
+  lines.push(text);
+  if (lines.length > 10) lines.shift();
+  logEl.textContent = lines.join('\n');
+  logEl.classList.toggle('err', !!isError);
+}
+
+context.setLoggerLevel(cast.framework.LoggerLevel.DEBUG);
+
+// every load request, as the sender sent it
+player.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, (req) => {
+  const m = req.media || {};
+  log(`LOAD ${m.contentType} ${m.contentId}`);
+  return req;
+});
+
+for (const type of [E.REQUEST_LOAD, E.PLAYER_LOAD_COMPLETE, E.PLAYER_PLAYING, E.BUFFERING, E.PAUSE, E.ENDED]) {
+  player.addEventListener(type, (e) => log(`${e.type}`));
+}
+
+player.addEventListener(E.ERROR, (e) => {
+  log(`ERROR ${JSON.stringify(e.detailedErrorCode)} ${e.reason || ''} ${e.type}`, true);
+});
+player.addEventListener(E.MEDIA_STATUS, (e) => {
+  const s = e.mediaStatus || {};
+  if (s.idleReason) log(`IDLE reason=${s.idleReason}`, s.idleReason === 'ERROR');
+});
+
+const options = new cast.framework.CastReceiverOptions();
+options.useShakaForHls = true;
+options.playbackConfig = new cast.framework.PlaybackConfig();
+options.playbackConfig.autoResumeDuration = 5;
+// log each HLS segment fetch (url + when) to see whether a huge segment stalls
+options.playbackConfig.segmentRequestHandler = (req) => log(`GET ${req.url.split('?')[0].split('/').slice(-2).join('/')}`);
+options.supportedCommands = cast.framework.messages.Command.ALL_BASIC_MEDIA;
+
+context.start(options);
+</script>
+</body>
+</html>
